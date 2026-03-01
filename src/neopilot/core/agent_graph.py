@@ -406,17 +406,35 @@ async def executor_node(
             logger.info("Arquivo salvo", filename=filename)
 
         elif action_type == "run_command":
-            # Executa comando shell em xterm visível — usuário pode acompanhar e interagir
-            import subprocess as _sp, asyncio as _asyncio
+            # Executa comando shell em terminal visível — usuário pode acompanhar e interagir
+            import subprocess as _sp, asyncio as _asyncio, shlex as _shlex
             cmd_str = value if value else target
             env_r = {**__import__("os").environ, "DISPLAY": ":0"}
-            _sp.Popen(
-                ["xterm", "-e", f"bash -c {__import__('shlex').quote(cmd_str + '; echo; echo \"--- FIM ---\"; exec bash')}"],
-                env=env_r, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
-            )
-            await _asyncio.sleep(2)
-            success = True
-            result_text = f"Comando iniciado em terminal: {cmd_str[:100]}"
+            # Detecta terminal disponível
+            _term_cmd = None
+            for _term in ["konsole", "gnome-terminal", "x-terminal-emulator", "xfce4-terminal", "xterm", "alacritty", "kitty"]:
+                if _sp.run(["which", _term], capture_output=True).returncode == 0:
+                    _term_cmd = _term
+                    break
+            if _term_cmd:
+                wrap = cmd_str + '; echo; read -p "--- Pressione Enter para fechar ---"'
+                if _term_cmd == "konsole":
+                    _sp.Popen(["konsole", "--noclose", "-e", "bash", "-c", wrap], env=env_r, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                elif _term_cmd in ("gnome-terminal", "x-terminal-emulator"):
+                    _sp.Popen([_term_cmd, "--", "bash", "-c", wrap], env=env_r, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                else:
+                    _sp.Popen([_term_cmd, "-e", f"bash -c {_shlex.quote(wrap)}"], env=env_r, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                await _asyncio.sleep(2)
+                success = True
+                result_text = f"Comando iniciado em terminal ({_term_cmd}): {cmd_str[:100]}"
+            else:
+                # Fallback: executa direto (sem interface visual)
+                proc = await _asyncio.create_subprocess_shell(
+                    cmd_str, stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.PIPE, env=env_r
+                )
+                stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=60)
+                success = proc.returncode == 0
+                result_text = (stdout.decode()[:200] if success else stderr.decode()[:200])
             logger.info("Comando executado", cmd=cmd_str[:80])
 
         elif action_type in ("click", "type", "hotkey"):
