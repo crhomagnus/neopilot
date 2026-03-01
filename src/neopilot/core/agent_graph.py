@@ -293,12 +293,13 @@ async def executor_node(
 
     try:
         if action_type == "done":
-            # Use answer from plan step value/description, or reasoner's value
+            # Use answer from reasoner value, or plan step value/description
             plan = state.get("plan", [])
             step_idx = state.get("current_step", 0)
             plan_step = plan[step_idx] if step_idx < len(plan) else {}
             answer = value or plan_step.get("value") or plan_step.get("description") or ""
-            result_msg = answer if answer and answer != task else "Tarefa concluída com sucesso"
+            original_task = state.get("task", "")
+            result_msg = answer if (answer and answer != original_task) else "Tarefa concluída com sucesso"
             return {
                 "done": True,
                 "result": result_msg,
