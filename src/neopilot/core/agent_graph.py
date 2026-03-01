@@ -343,16 +343,28 @@ async def executor_node(
             # Abre aplicativo no desktop em tempo real
             import subprocess as _sp
             import asyncio as _asyncio
+            import subprocess as _sp_check
+            def _find_term():
+                for t in ["konsole", "gnome-terminal", "x-terminal-emulator", "xfce4-terminal", "xterm", "alacritty", "kitty"]:
+                    if _sp_check.run(["which", t], capture_output=True).returncode == 0:
+                        return t
+                return "konsole"
+            _term = _find_term()
             app_map = {
                 "libreoffice": ["soffice", "--writer", "--norestore"],
                 "libreoffice writer": ["soffice", "--writer", "--norestore"],
                 "writer": ["soffice", "--writer", "--norestore"],
                 "libreoffice calc": ["soffice", "--calc", "--norestore"],
                 "calc": ["soffice", "--calc", "--norestore"],
+                "libreoffice impress": ["soffice", "--impress", "--norestore"],
                 "firefox": ["firefox"],
-                "terminal": ["xterm"],
+                "chromium": ["chromium-browser"],
+                "terminal": [_term],
+                "konsole": ["konsole"],
                 "gedit": ["gedit"],
                 "kate": ["kate"],
+                "nautilus": ["nautilus"],
+                "files": ["nautilus"],
             }
             app_key = target.lower().strip()
             cmd = app_map.get(app_key, app_key.split())
