@@ -1,6 +1,6 @@
 """
-NeoPilot Mini-Janela Flutuante (300×400px)
-GTK4 always-on-top com ícone na system tray.
+NeoPilot Mini-Janela Flutuante (300×420px)
+GTK4 always-on-top com conexão automática ao agente.
 Fallback para Qt6 (PyQt6) se GTK4 não disponível.
 """
 
@@ -20,18 +20,20 @@ logger = get_logger("ui")
 
 
 class AgentStatus(str, Enum):
-    IDLE = "idle"
-    LISTENING = "listening"
-    THINKING = "thinking"
-    ACTING = "acting"
-    WAITING = "waiting"      # human-in-the-loop
-    ERROR = "error"
-    PROFESSOR = "professor"  # Modo Professor ativo
+    DISCONNECTED = "disconnected"   # Agente não iniciado
+    CONNECTING = "connecting"       # Inicializando
+    IDLE = "idle"                   # Pronto
+    LISTENING = "listening"         # Ouvindo microfone
+    THINKING = "thinking"           # Processando
+    ACTING = "acting"               # Executando ação
+    WAITING = "waiting"             # Aguardando confirmação
+    ERROR = "error"                 # Erro
+    PROFESSOR = "professor"         # Modo Professor
 
 
 @dataclass
 class ChatMessage:
-    role: str  # "user" | "agent" | "system" | "error"
+    role: str   # "user" | "agent" | "system" | "error"
     content: str
     timestamp: float = 0.0
     action_type: Optional[str] = None
@@ -53,15 +55,14 @@ class FloatingWindowBase:
     """Interface base para janelas flutuantes."""
 
     WIDTH = 300
-    HEIGHT = 400
+    HEIGHT = 420
 
     def __init__(self):
-        self._status = AgentStatus.IDLE
+        self._status = AgentStatus.DISCONNECTED
         self._messages: list[ChatMessage] = []
         self._on_user_input: Optional[Callable[[str], None]] = None
         self._on_voice_toggle: Optional[Callable] = None
-        self._on_approve: Optional[Callable] = None
-        self._on_deny: Optional[Callable] = None
+        self._on_connect: Optional[Callable] = None
         self._pending_confirmation: Optional[ConfirmationRequest] = None
         self._professor_mode = False
         self._update_queue: queue.Queue = queue.Queue()
@@ -71,6 +72,10 @@ class FloatingWindowBase:
 
     def on_voice_toggle(self, callback: Callable) -> None:
         self._on_voice_toggle = callback
+
+    def on_connect(self, callback: Callable) -> None:
+        """Callback chamado quando usuário clica em 'Iniciar Agente'."""
+        self._on_connect = callback
 
     def set_status(self, status: AgentStatus) -> None:
         self._status = status
@@ -97,295 +102,485 @@ class FloatingWindowBase:
 
 class GTK4FloatingWindow(FloatingWindowBase):
     """
-    Mini-janela flutuante usando GTK4.
-    300×400px, always-on-top, bordas arredondadas, transparência.
+    Mini-janela flutuante GTK4.
+    Autocontida: inicia o agente internamente ao clicar em 'Iniciar'.
     """
+
+    # Mapa status → (ícone, texto, css-class)
+    STATUS_MAP = {
+        AgentStatus.DISCONNECTED: ("⬤", "Desconectado",  "s-off"),
+        AgentStatus.CONNECTING:   ("⬤", "Conectando…",   "s-wait"),
+        AgentStatus.IDLE:         ("⬤", "Pronto",        "s-on"),
+        AgentStatus.LISTENING:    ("⬤", "Ouvindo…",      "s-listen"),
+        AgentStatus.THINKING:     ("⬤", "Pensando…",     "s-think"),
+        AgentStatus.ACTING:       ("⬤", "Executando…",   "s-act"),
+        AgentStatus.WAITING:      ("⬤", "Aguardando…",   "s-wait"),
+        AgentStatus.ERROR:        ("⬤", "Erro",          "s-err"),
+        AgentStatus.PROFESSOR:    ("⬤", "Prof. Ativo",   "s-prof"),
+    }
 
     def __init__(self):
         super().__init__()
         self._app = None
         self._window = None
         self._chat_list = None
+        self._scroll = None
         self._input_entry = None
+        self._send_btn = None
+        self._status_dot = None
         self._status_label = None
-        self._voice_btn = None
+        self._connect_banner = None   # banner "Iniciar Agente"
         self._confirm_box = None
         self._available = False
+        self._glib = None
         self._check_gtk4()
 
     def _check_gtk4(self) -> None:
         try:
             import gi
             gi.require_version("Gtk", "4.0")
-            gi.require_version("Adw", "1")
+            from gi.repository import Gtk  # noqa: F401
             self._available = True
-        except (ImportError, ValueError):
-            try:
-                import gi
-                gi.require_version("Gtk", "4.0")
-                self._available = True
-            except Exception:
-                logger.warning("GTK4 não disponível")
+        except Exception:
+            logger.warning("GTK4 não disponível")
+
+    # ── run ────────────────────────────────────────────────────────────────
 
     def run(self) -> None:
         if not self._available:
-            logger.warning("GTK4 não disponível, usando fallback de console")
             self._run_console_fallback()
             return
-
         try:
             import gi
             gi.require_version("Gtk", "4.0")
             from gi.repository import Gtk, GLib
+            self._glib = GLib
 
             self._app = Gtk.Application(application_id="com.neopilot.overlay")
             self._app.connect("activate", self._on_activate)
-
-            # Thread para processar updates da queue
-            GLib.timeout_add(100, self._process_queue)
-
+            GLib.timeout_add(80, self._process_queue)
             self._app.run([])
         except Exception as e:
             logger.error("GTK4 falhou", error=str(e))
             self._run_console_fallback()
+
+    def stop(self) -> None:
+        if self._app:
+            self._app.quit()
+
+    # ── build UI ───────────────────────────────────────────────────────────
 
     def _on_activate(self, app: Any) -> None:
         import gi
         gi.require_version("Gtk", "4.0")
         from gi.repository import Gtk, Gdk
 
-        # Janela principal
-        self._window = Gtk.ApplicationWindow(application=app)
-        self._window.set_title("NeoPilot")
-        self._window.set_default_size(self.WIDTH, self.HEIGHT)
-        self._window.set_resizable(False)
+        win = Gtk.ApplicationWindow(application=app)
+        win.set_title("NeoPilot")
+        win.set_default_size(self.WIDTH, self.HEIGHT)
+        win.set_resizable(True)
+        self._window = win
 
-        # Always on top via display hints
-        self._window.set_decorated(True)
-
-        # CSS customizado
-        css_provider = Gtk.CssProvider()
-        css_provider.load_from_data(self._get_css().encode())
+        # CSS
+        css = Gtk.CssProvider()
+        css.load_from_data(self._css().encode())
         Gtk.StyleContext.add_provider_for_display(
-            Gdk.Display.get_default(),
-            css_provider,
+            Gdk.Display.get_default(), css,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
 
-        # Layout principal
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        vbox.set_margin_top(8)
-        vbox.set_margin_bottom(8)
-        vbox.set_margin_start(8)
-        vbox.set_margin_end(8)
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        root.set_margin_top(0)
+        root.set_margin_bottom(8)
+        root.set_margin_start(8)
+        root.set_margin_end(8)
 
-        # Header: status + botão voz
-        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        # ── Header ──
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        header.set_margin_top(8)
+        header.set_margin_bottom(6)
 
-        self._status_label = Gtk.Label(label="● Idle")
-        self._status_label.add_css_class("status-idle")
-        header.append(self._status_label)
+        title = Gtk.Label(label="NeoPilot")
+        title.add_css_class("title")
+        header.append(title)
 
-        # Separador elástico
         spacer = Gtk.Box()
         spacer.set_hexpand(True)
         header.append(spacer)
 
+        # Indicador de status (ponto + texto)
+        self._status_dot = Gtk.Label(label="⬤")
+        self._status_dot.add_css_class("s-off")
+        header.append(self._status_dot)
+
+        self._status_label = Gtk.Label(label="Desconectado")
+        self._status_label.add_css_class("status-text")
+        header.append(self._status_label)
+
+        # Botão voz
         self._voice_btn = Gtk.Button(label="🎤")
+        self._voice_btn.add_css_class("icon-btn")
         self._voice_btn.connect("clicked", self._on_voice_click)
-        self._voice_btn.add_css_class("voice-btn")
+        self._voice_btn.set_tooltip_text("Ativar/desativar microfone")
         header.append(self._voice_btn)
 
-        # Botão professor mode
+        # Botão professor
         prof_btn = Gtk.ToggleButton(label="🎓")
+        prof_btn.add_css_class("icon-btn")
+        prof_btn.set_tooltip_text("Modo Professor")
         prof_btn.connect("toggled", self._on_professor_toggle)
-        prof_btn.set_tooltip_text("Ativar Modo Professor")
         header.append(prof_btn)
 
-        vbox.append(header)
+        root.append(header)
 
         # Separador
         sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-        vbox.append(sep)
+        root.append(sep)
 
-        # Área de chat (scrollable)
-        scroll = Gtk.ScrolledWindow()
-        scroll.set_vexpand(True)
-        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        # ── Banner "Iniciar Agente" (visível enquanto desconectado) ──
+        self._connect_banner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self._connect_banner.set_margin_top(24)
+        self._connect_banner.set_margin_bottom(12)
+        self._connect_banner.set_margin_start(16)
+        self._connect_banner.set_margin_end(16)
+        self._connect_banner.set_valign(Gtk.Align.CENTER)
+        self._connect_banner.set_vexpand(True)
+
+        robot_lbl = Gtk.Label(label="🤖")
+        robot_lbl.add_css_class("robot-icon")
+        self._connect_banner.append(robot_lbl)
+
+        hello_lbl = Gtk.Label(label="Olá! Sou o NeoPilot.")
+        hello_lbl.add_css_class("hello-text")
+        hello_lbl.set_wrap(True)
+        hello_lbl.set_justify(Gtk.Justification.CENTER)
+        self._connect_banner.append(hello_lbl)
+
+        sub_lbl = Gtk.Label(
+            label="Posso abrir apps, navegar na web,\n"
+                  "escrever documentos e muito mais.\n"
+                  "Clique para começar."
+        )
+        sub_lbl.add_css_class("sub-text")
+        sub_lbl.set_wrap(True)
+        sub_lbl.set_justify(Gtk.Justification.CENTER)
+        self._connect_banner.append(sub_lbl)
+
+        connect_btn = Gtk.Button(label="  Iniciar Agente  ")
+        connect_btn.add_css_class("connect-btn")
+        connect_btn.connect("clicked", self._on_connect_click)
+        connect_btn.set_halign(Gtk.Align.CENTER)
+        self._connect_banner.append(connect_btn)
+
+        root.append(self._connect_banner)
+
+        # ── Área de chat (oculta até conectar) ──
+        self._scroll = Gtk.ScrolledWindow()
+        self._scroll.set_vexpand(True)
+        self._scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self._scroll.set_visible(False)
 
         self._chat_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        scroll.set_child(self._chat_list)
-        vbox.append(scroll)
+        self._chat_list.set_margin_top(6)
+        self._chat_list.set_margin_bottom(4)
+        self._scroll.set_child(self._chat_list)
+        root.append(self._scroll)
 
-        # Caixa de confirmação (inicialmente oculta)
+        # ── Caixa de confirmação ──
         self._confirm_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         self._confirm_box.set_visible(False)
+        self._confirm_box.set_margin_top(4)
 
         approve_btn = Gtk.Button(label="✓ Aprovar")
         approve_btn.add_css_class("approve-btn")
         approve_btn.connect("clicked", self._on_approve_click)
+        approve_btn.set_hexpand(True)
         self._confirm_box.append(approve_btn)
 
-        deny_btn = Gtk.Button(label="✗ Negar")
+        deny_btn = Gtk.Button(label="✗ Cancelar")
         deny_btn.add_css_class("deny-btn")
         deny_btn.connect("clicked", self._on_deny_click)
+        deny_btn.set_hexpand(True)
         self._confirm_box.append(deny_btn)
 
-        vbox.append(self._confirm_box)
+        root.append(self._confirm_box)
 
-        # Input de texto
+        # ── Input ──
         input_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        input_box.set_margin_top(6)
 
         self._input_entry = Gtk.Entry()
-        self._input_entry.set_placeholder_text("Digite ou fale um comando...")
+        self._input_entry.set_placeholder_text("Digite um comando…")
         self._input_entry.set_hexpand(True)
         self._input_entry.connect("activate", self._on_send_click)
+        self._input_entry.set_sensitive(False)   # Desabilitado até conectar
         input_box.append(self._input_entry)
 
-        send_btn = Gtk.Button(label="➤")
-        send_btn.connect("clicked", self._on_send_click)
-        send_btn.add_css_class("send-btn")
-        input_box.append(send_btn)
+        self._send_btn = Gtk.Button(label="➤")
+        self._send_btn.add_css_class("send-btn")
+        self._send_btn.connect("clicked", self._on_send_click)
+        self._send_btn.set_sensitive(False)      # Desabilitado até conectar
+        input_box.append(self._send_btn)
 
-        vbox.append(input_box)
-        self._window.set_child(vbox)
-        self._window.present()
+        root.append(input_box)
+        win.set_child(root)
+        win.present()
 
-    def _get_css(self) -> str:
+    # ── CSS ───────────────────────────────────────────────────────────────
+
+    def _css(self) -> str:
         return """
         window {
-            background-color: rgba(28, 28, 35, 0.95);
-            border-radius: 12px;
+            background-color: #1a1a24;
         }
-        label { color: #e0e0e0; font-size: 12px; }
-        .status-idle { color: #888888; font-weight: bold; }
-        .status-listening { color: #4fc3f7; font-weight: bold; }
-        .status-thinking { color: #ffb74d; font-weight: bold; }
-        .status-acting { color: #81c784; font-weight: bold; }
-        .status-waiting { color: #f06292; font-weight: bold; }
-        .status-error { color: #e57373; font-weight: bold; }
-        .status-professor { color: #ce93d8; font-weight: bold; }
+        /* Título */
+        .title {
+            color: #a78bfa;
+            font-weight: bold;
+            font-size: 13px;
+        }
+        /* Status dot */
+        .s-off    { color: #555566; font-size: 10px; }
+        .s-on     { color: #4ade80; font-size: 10px; }
+        .s-wait   { color: #fbbf24; font-size: 10px; }
+        .s-listen { color: #38bdf8; font-size: 10px; }
+        .s-think  { color: #fb923c; font-size: 10px; }
+        .s-act    { color: #4ade80; font-size: 10px; }
+        .s-err    { color: #f87171; font-size: 10px; }
+        .s-prof   { color: #c084fc; font-size: 10px; }
+        .status-text {
+            color: #888899;
+            font-size: 10px;
+            margin-right: 4px;
+        }
+        /* Banner de boas-vindas */
+        .robot-icon { font-size: 36px; margin-bottom: 4px; }
+        .hello-text { color: #e2e8f0; font-size: 13px; font-weight: bold; }
+        .sub-text   { color: #94a3b8; font-size: 11px; margin-top: 4px; }
+        /* Botão conectar */
+        .connect-btn {
+            background-color: #7c3aed;
+            color: #ffffff;
+            border: none;
+            border-radius: 10px;
+            padding: 8px 20px;
+            font-size: 12px;
+            font-weight: bold;
+            margin-top: 12px;
+        }
+        .connect-btn:hover { background-color: #6d28d9; }
+        /* Mensagens */
         .msg-user {
-            background-color: rgba(33, 150, 243, 0.3);
-            border-radius: 8px;
+            background-color: rgba(124, 58, 237, 0.35);
+            border-radius: 10px 10px 2px 10px;
             padding: 6px 10px;
-            margin: 2px 20px 2px 4px;
-            color: #bbdefb;
+            margin: 2px 4px 2px 30px;
+            color: #ddd6fe;
+            font-size: 12px;
         }
         .msg-agent {
-            background-color: rgba(76, 175, 80, 0.2);
-            border-radius: 8px;
+            background-color: rgba(30, 41, 59, 0.9);
+            border-radius: 10px 10px 10px 2px;
             padding: 6px 10px;
-            margin: 2px 4px 2px 20px;
-            color: #c8e6c9;
+            margin: 2px 30px 2px 4px;
+            color: #e2e8f0;
+            font-size: 12px;
         }
         .msg-system {
-            color: #9e9e9e;
+            color: #64748b;
             font-style: italic;
+            font-size: 11px;
             padding: 2px 8px;
         }
         .msg-error {
-            background-color: rgba(244, 67, 54, 0.2);
+            background-color: rgba(239, 68, 68, 0.2);
             border-radius: 8px;
             padding: 4px 8px;
-            color: #ef9a9a;
-        }
-        entry {
-            background-color: rgba(255, 255, 255, 0.08);
-            color: #e0e0e0;
-            border: 1px solid rgba(255,255,255,0.15);
-            border-radius: 8px;
-            padding: 6px;
+            color: #fca5a5;
             font-size: 12px;
         }
-        button {
-            background-color: rgba(255,255,255,0.08);
-            color: #e0e0e0;
-            border: none;
-            border-radius: 8px;
-            padding: 4px 10px;
+        /* Separador */
+        separator { background-color: #2d2d3d; min-height: 1px; }
+        /* Input */
+        entry {
+            background-color: #252535;
+            color: #e2e8f0;
+            border: 1px solid #3d3d50;
+            border-radius: 10px;
+            padding: 7px 10px;
+            font-size: 12px;
         }
-        button:hover { background-color: rgba(255,255,255,0.15); }
-        .voice-btn { color: #4fc3f7; }
-        .send-btn { color: #81c784; }
-        .approve-btn { color: #81c784; background-color: rgba(76,175,80,0.2); }
-        .deny-btn { color: #e57373; background-color: rgba(244,67,54,0.2); }
+        entry:focus { border-color: #7c3aed; }
+        /* Botões gerais */
+        .icon-btn {
+            background-color: transparent;
+            border: none;
+            border-radius: 6px;
+            padding: 3px 6px;
+            color: #94a3b8;
+            font-size: 13px;
+        }
+        .icon-btn:hover { background-color: rgba(255,255,255,0.08); }
+        .send-btn {
+            background-color: #7c3aed;
+            color: #fff;
+            border: none;
+            border-radius: 10px;
+            padding: 6px 12px;
+            font-size: 13px;
+        }
+        .send-btn:hover { background-color: #6d28d9; }
+        .send-btn:disabled { background-color: #3d3d50; color: #666; }
+        .approve-btn {
+            background-color: rgba(74,222,128,0.2);
+            color: #4ade80;
+            border: 1px solid rgba(74,222,128,0.4);
+            border-radius: 8px;
+            padding: 5px;
+        }
+        .deny-btn {
+            background-color: rgba(248,113,113,0.2);
+            color: #f87171;
+            border: 1px solid rgba(248,113,113,0.4);
+            border-radius: 8px;
+            padding: 5px;
+        }
+        label { color: #e2e8f0; }
         """
 
+    # ── Queue processing ──────────────────────────────────────────────────
+
     def _process_queue(self) -> bool:
-        """Processa updates da queue (chamado no main loop GTK)."""
         try:
             while True:
                 update_type, data = self._update_queue.get_nowait()
                 if update_type == "status":
-                    self._update_status_label(data)
+                    self._apply_status(data)
                 elif update_type == "message":
-                    self._add_message_widget(data)
+                    self._append_message(data)
                 elif update_type == "confirmation":
-                    self._show_confirmation_ui(data)
+                    self._show_confirm_ui(data)
                 elif update_type == "professor":
-                    self._toggle_professor_ui(data)
+                    if data:
+                        self._append_message(ChatMessage(role="system", content="🎓 Modo Professor ativado"))
         except queue.Empty:
             pass
-        return True  # Continua o timeout
+        return True
 
-    def _update_status_label(self, status: AgentStatus) -> None:
-        if not self._status_label:
-            return
-        icons = {
-            AgentStatus.IDLE: "● Idle",
-            AgentStatus.LISTENING: "🎤 Ouvindo...",
-            AgentStatus.THINKING: "💭 Pensando...",
-            AgentStatus.ACTING: "⚡ Executando...",
-            AgentStatus.WAITING: "⏳ Aguardando...",
-            AgentStatus.ERROR: "✗ Erro",
-            AgentStatus.PROFESSOR: "🎓 Modo Professor",
-        }
-        css_class = f"status-{status.value}"
-        self._status_label.set_text(icons.get(status, "●"))
-        for cls in ["status-idle", "status-listening", "status-thinking",
-                    "status-acting", "status-waiting", "status-error", "status-professor"]:
-            self._status_label.remove_css_class(cls)
-        self._status_label.add_css_class(css_class)
+    def _apply_status(self, status: AgentStatus) -> None:
+        dot_txt, label_txt, css = self.STATUS_MAP.get(status, ("⬤", str(status), "s-off"))
+        if self._status_dot:
+            for c in [v[2] for v in self.STATUS_MAP.values()]:
+                self._status_dot.remove_css_class(c)
+            self._status_dot.add_css_class(css)
+        if self._status_label:
+            self._status_label.set_text(label_txt)
 
-    def _add_message_widget(self, msg: ChatMessage) -> None:
+        # Ao conectar: oculta banner, mostra chat, habilita input
+        if status not in (AgentStatus.DISCONNECTED, AgentStatus.CONNECTING):
+            if self._connect_banner and self._connect_banner.get_visible():
+                self._connect_banner.set_visible(False)
+                if self._scroll:
+                    self._scroll.set_visible(True)
+                if self._input_entry:
+                    self._input_entry.set_sensitive(True)
+                    self._input_entry.grab_focus()
+                if self._send_btn:
+                    self._send_btn.set_sensitive(True)
+        elif status == AgentStatus.CONNECTING:
+            # Troca banner por spinner de texto
+            if self._connect_banner:
+                pass  # o label de status já indica "Conectando…"
+
+    def _append_message(self, msg: ChatMessage) -> None:
         if not self._chat_list:
             return
-
+        import gi
+        gi.require_version("Gtk", "4.0")
         from gi.repository import Gtk
 
         label = Gtk.Label(label=msg.content)
         label.set_wrap(True)
         label.set_xalign(0)
-        label.set_max_width_chars(32)
+        label.set_max_width_chars(30)
         label.add_css_class(f"msg-{msg.role}")
-
         self._chat_list.append(label)
 
-        # Auto-scroll para o final
-        adj = self._chat_list.get_parent().get_vadjustment() if self._chat_list.get_parent() else None
-        if adj:
-            adj.set_value(adj.get_upper())
+        # Scroll para o final
+        if self._scroll:
+            adj = self._scroll.get_vadjustment()
+            if adj:
+                self._glib.idle_add(lambda: adj.set_value(adj.get_upper()))
 
-    def _show_confirmation_ui(self, request: ConfirmationRequest) -> None:
+    def _show_confirm_ui(self, request: ConfirmationRequest) -> None:
         if self._confirm_box:
             self._confirm_box.set_visible(True)
-        self.add_message(ChatMessage(
-            role="system",
-            content=f"⚠ Confirmar: {request.description}"
-        ))
+        self._append_message(ChatMessage(role="system", content=f"⚠ Confirmar: {request.description}"))
 
-    def _toggle_professor_ui(self, enabled: bool) -> None:
-        if enabled:
-            self.add_message(ChatMessage(role="system", content="🎓 Modo Professor ativado"))
+    # ── Event handlers ────────────────────────────────────────────────────
 
-    def _on_voice_click(self, _btn: Any) -> None:
-        if self._on_voice_toggle:
-            self._on_voice_toggle()
+    def _on_connect_click(self, _btn: Any) -> None:
+        """Usuário clicou em 'Iniciar Agente'."""
+        self.set_status(AgentStatus.CONNECTING)
+        self._append_message(ChatMessage(role="system", content="Iniciando agente, aguarde…"))
+        if self._on_connect:
+            self._on_connect()
+        else:
+            # Auto-conecta sem precisar do CLI
+            self._auto_connect()
 
-    def _on_professor_toggle(self, btn: Any) -> None:
-        enabled = btn.get_active()
-        self.set_professor_mode(enabled)
+    def _auto_connect(self) -> None:
+        """Inicializa o orquestrador internamente em background."""
+        import asyncio as _asyncio
+
+        loop = _asyncio.new_event_loop()
+        self._loop = loop
+
+        async def _init():
+            from neopilot.core.agent_graph import NeoPilotOrchestrator
+            from neopilot.voice.tts import TTSEngine
+
+            orch = NeoPilotOrchestrator()
+            await orch.initialize()
+            self._orchestrator = orch
+            self._tts = TTSEngine()
+
+            def _run_task(task: str) -> None:
+                self.set_status(AgentStatus.THINKING)
+
+                async def _exec():
+                    return await orch.run_task(task)
+
+                def _done(fut):
+                    try:
+                        result = fut.result()
+                        success = result.get("success", False)
+                        msg = result.get("result", "Concluído")
+                        self.add_message(ChatMessage(
+                            role="agent" if success else "error",
+                            content=msg,
+                        ))
+                    except Exception as e:
+                        self.add_message(ChatMessage(role="error", content=f"Erro: {e}"))
+                    finally:
+                        self.set_status(AgentStatus.IDLE)
+
+                fut = _asyncio.run_coroutine_threadsafe(_exec(), loop)
+                fut.add_done_callback(_done)
+
+            self._on_user_input = _run_task
+            self.set_status(AgentStatus.IDLE)
+            self.add_message(ChatMessage(
+                role="agent",
+                content="Pronto! Como posso ajudar?\n\nExemplos:\n• Abre o LibreOffice Writer\n• Pesquisa sobre Python 3.13\n• Cria um doc sobre IA",
+            ))
+
+        def _run_loop():
+            loop.run_until_complete(_init())
+            loop.run_forever()
+
+        t = threading.Thread(target=_run_loop, daemon=True, name="neopilot-agent")
+        t.start()
 
     def _on_send_click(self, _widget: Any) -> None:
         if not self._input_entry:
@@ -393,16 +588,17 @@ class GTK4FloatingWindow(FloatingWindowBase):
         text = self._input_entry.get_text().strip()
         if not text:
             return
-        # Sempre mostra a mensagem do usuário no chat
-        self.add_message(ChatMessage(role="user", content=text))
+        self._append_message(ChatMessage(role="user", content=text))
         self._input_entry.set_text("")
         if self._on_user_input:
             self._on_user_input(text)
-        else:
-            self.add_message(ChatMessage(
-                role="system",
-                content="Inicie com 'neopilot chat' para conectar o agente.",
-            ))
+
+    def _on_voice_click(self, _btn: Any) -> None:
+        if self._on_voice_toggle:
+            self._on_voice_toggle()
+
+    def _on_professor_toggle(self, btn: Any) -> None:
+        self.set_professor_mode(btn.get_active())
 
     def _on_approve_click(self, _btn: Any) -> None:
         if self._pending_confirmation:
@@ -418,14 +614,16 @@ class GTK4FloatingWindow(FloatingWindowBase):
         if self._confirm_box:
             self._confirm_box.set_visible(False)
 
+    # ── Fallback console ──────────────────────────────────────────────────
+
     def _run_console_fallback(self) -> None:
-        """Fallback simples de console quando GTK4 não está disponível."""
         logger.info("Rodando em modo console (sem GUI)")
         print("\n" + "="*40)
         print("  NeoPilot — Modo Console")
         print("="*40)
-        print("Digite comandos ou 'sair' para encerrar\n")
-
+        self._auto_connect()
+        time.sleep(3)  # Aguarda init
+        print("Pronto! Digite comandos ('sair' para encerrar)\n")
         while True:
             try:
                 text = input("Você: ").strip()
@@ -433,12 +631,9 @@ class GTK4FloatingWindow(FloatingWindowBase):
                     break
                 if text and self._on_user_input:
                     self._on_user_input(text)
+                    time.sleep(0.5)
             except (KeyboardInterrupt, EOFError):
                 break
-
-    def stop(self) -> None:
-        if self._app:
-            self._app.quit()
 
 
 class Qt6FloatingWindow(FloatingWindowBase):
@@ -448,14 +643,14 @@ class Qt6FloatingWindow(FloatingWindowBase):
         super().__init__()
         self._available = False
         try:
-            from PyQt6.QtWidgets import QApplication
+            from PyQt6.QtWidgets import QApplication  # noqa: F401
             self._available = True
         except ImportError:
             pass
 
     def run(self) -> None:
         if not self._available:
-            GTK4FloatingWindow._run_console_fallback(self)
+            GTK4FloatingWindow()._run_console_fallback()
             return
 
         from PyQt6.QtWidgets import (
@@ -464,11 +659,10 @@ class Qt6FloatingWindow(FloatingWindowBase):
             QScrollArea, QFrame,
         )
         from PyQt6.QtCore import Qt, QTimer
-        from PyQt6.QtGui import QColor
         import sys
 
         app = QApplication(sys.argv)
-        app.setStyleSheet(self._get_qt_style())
+        app.setStyleSheet(self._qt_css())
 
         win = QMainWindow()
         win.setWindowTitle("NeoPilot")
@@ -481,37 +675,82 @@ class Qt6FloatingWindow(FloatingWindowBase):
         layout.setSpacing(4)
         layout.setContentsMargins(8, 8, 8, 8)
 
-        # Status bar
-        self._qt_status = QLabel("● Idle")
-        layout.addWidget(self._qt_status)
+        # Header
+        hdr = QHBoxLayout()
+        title = QLabel("NeoPilot")
+        title.setStyleSheet("color:#a78bfa; font-weight:bold; font-size:13px;")
+        hdr.addWidget(title)
+        hdr.addStretch()
+        self._qt_status = QLabel("⬤ Desconectado")
+        self._qt_status.setStyleSheet("color:#555566; font-size:10px;")
+        hdr.addWidget(self._qt_status)
+        layout.addLayout(hdr)
 
-        # Chat area
-        scroll = QScrollArea()
+        # Banner conectar
+        self._qt_banner = QWidget()
+        bl = QVBoxLayout(self._qt_banner)
+        bl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        rl = QLabel("🤖"); rl.setStyleSheet("font-size:36px;"); rl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bl.addWidget(rl)
+        hl = QLabel("Olá! Sou o NeoPilot."); hl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bl.addWidget(hl)
+        sl = QLabel("Clique para começar."); sl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sl.setStyleSheet("color:#94a3b8; font-size:11px;")
+        bl.addWidget(sl)
+        self._qt_connect_btn = QPushButton("Iniciar Agente")
+        self._qt_connect_btn.setStyleSheet(
+            "background:#7c3aed; color:#fff; border-radius:8px; padding:8px 20px; font-weight:bold;"
+        )
+        self._qt_connect_btn.clicked.connect(self._qt_on_connect)
+        bl.addWidget(self._qt_connect_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._qt_banner, stretch=1)
+
+        # Chat
+        self._qt_scroll = QScrollArea()
         self._qt_chat = QWidget()
         self._qt_chat_layout = QVBoxLayout(self._qt_chat)
-        scroll.setWidget(self._qt_chat)
-        scroll.setWidgetResizable(True)
-        layout.addWidget(scroll, 1)
+        self._qt_chat_layout.addStretch()
+        self._qt_scroll.setWidget(self._qt_chat)
+        self._qt_scroll.setWidgetResizable(True)
+        self._qt_scroll.setVisible(False)
+        layout.addWidget(self._qt_scroll, stretch=1)
 
         # Input
         input_row = QHBoxLayout()
         self._qt_input = QLineEdit()
-        self._qt_input.setPlaceholderText("Digite um comando...")
+        self._qt_input.setPlaceholderText("Digite um comando…")
         self._qt_input.returnPressed.connect(self._qt_send)
+        self._qt_input.setEnabled(False)
         input_row.addWidget(self._qt_input)
-
-        send_btn = QPushButton("➤")
-        send_btn.clicked.connect(self._qt_send)
-        input_row.addWidget(send_btn)
+        self._qt_send_btn = QPushButton("➤")
+        self._qt_send_btn.clicked.connect(self._qt_send)
+        self._qt_send_btn.setEnabled(False)
+        self._qt_send_btn.setStyleSheet(
+            "background:#7c3aed; color:#fff; border-radius:8px; padding:6px 12px;"
+        )
+        input_row.addWidget(self._qt_send_btn)
         layout.addLayout(input_row)
 
-        # Timer para processar queue
         timer = QTimer()
         timer.timeout.connect(self._qt_process_queue)
-        timer.start(100)
+        timer.start(80)
 
         win.show()
         app.exec()
+
+    def _qt_on_connect(self) -> None:
+        self.set_status(AgentStatus.CONNECTING)
+        gtk_like = GTK4FloatingWindow.__new__(GTK4FloatingWindow)
+        FloatingWindowBase.__init__(gtk_like)
+        gtk_like._on_user_input = self._on_user_input
+        gtk_like._update_queue = self._update_queue
+
+        def forward_input(text):
+            if self._on_user_input:
+                self._on_user_input(text)
+
+        self._on_user_input_forward = forward_input
+        gtk_like._auto_connect_for(self)
 
     def _qt_send(self) -> None:
         text = self._qt_input.text().strip()
@@ -521,11 +760,6 @@ class Qt6FloatingWindow(FloatingWindowBase):
         self._qt_input.clear()
         if self._on_user_input:
             self._on_user_input(text)
-        else:
-            self.add_message(ChatMessage(
-                role="system",
-                content="Inicie com 'neopilot chat' para conectar o agente.",
-            ))
 
     def _qt_process_queue(self) -> None:
         try:
@@ -533,34 +767,38 @@ class Qt6FloatingWindow(FloatingWindowBase):
                 update_type, data = self._update_queue.get_nowait()
                 if update_type == "message":
                     self._qt_add_message(data)
+                elif update_type == "status":
+                    self._qt_apply_status(data)
         except queue.Empty:
             pass
 
+    def _qt_apply_status(self, status: AgentStatus) -> None:
+        _, label_txt, _ = GTK4FloatingWindow.STATUS_MAP.get(status, ("⬤", str(status), ""))
+        if self._qt_status:
+            self._qt_status.setText(f"⬤ {label_txt}")
+        if status not in (AgentStatus.DISCONNECTED, AgentStatus.CONNECTING):
+            if self._qt_banner and self._qt_banner.isVisible():
+                self._qt_banner.setVisible(False)
+                self._qt_scroll.setVisible(True)
+                self._qt_input.setEnabled(True)
+                self._qt_send_btn.setEnabled(True)
+
     def _qt_add_message(self, msg: ChatMessage) -> None:
         from PyQt6.QtWidgets import QLabel
+        from PyQt6.QtCore import Qt
         label = QLabel(msg.content)
         label.setWordWrap(True)
-        self._qt_chat_layout.addWidget(label)
+        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._qt_chat_layout.insertWidget(self._qt_chat_layout.count() - 1, label)
 
-    def _get_qt_style(self) -> str:
+    def _qt_css(self) -> str:
         return """
-        QMainWindow { background-color: #1c1c23; }
-        QWidget { background-color: #1c1c23; color: #e0e0e0; font-size: 12px; }
+        QMainWindow, QWidget { background-color: #1a1a24; color: #e2e8f0; font-size: 12px; }
         QLineEdit {
-            background-color: rgba(255,255,255,0.08);
-            border: 1px solid rgba(255,255,255,0.15);
-            border-radius: 6px;
-            padding: 4px;
-            color: #e0e0e0;
+            background-color: #252535; border: 1px solid #3d3d50;
+            border-radius: 8px; padding: 6px; color: #e2e8f0;
         }
-        QPushButton {
-            background-color: rgba(255,255,255,0.08);
-            border: none;
-            border-radius: 6px;
-            padding: 4px 10px;
-            color: #e0e0e0;
-        }
-        QPushButton:hover { background-color: rgba(255,255,255,0.15); }
+        QPushButton { border-radius: 6px; padding: 4px 10px; color: #e2e8f0; }
         QScrollArea { border: none; }
         """
 
@@ -573,10 +811,8 @@ def create_floating_window() -> FloatingWindowBase:
     gtk_win = GTK4FloatingWindow()
     if gtk_win._available:
         return gtk_win
-
     qt_win = Qt6FloatingWindow()
     if qt_win._available:
         return qt_win
-
     logger.warning("Nenhum toolkit GUI disponível, usando modo console")
-    return gtk_win  # usará o fallback console interno
+    return gtk_win
