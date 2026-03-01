@@ -108,19 +108,25 @@ async def planner_node(state: NeoPilotState, llm: Any, memory: MemoryManager) ->
             "  - Se exige apps/browser/arquivos: decomponha em passos.\n\n"
         )
         + "AÇÕES DISPONÍVEIS:\n"
-        "  open_app: target='libreoffice writer'|'firefox'|'libreoffice calc' — abre app\n"
+        "  open_app: target='libreoffice writer'|'firefox'|'libreoffice calc'|'terminal' — abre app\n"
         "  focus_window: target='nome da janela' — foca janela\n"
-        "  navigate: target='https://url.com' — navega no browser (APENAS URLs reais http/https)\n"
-        "  read_page — extrai texto da página atual\n"
+        "  navigate: target='https://url.com' — navega no browser (APENAS URLs http/https reais)\n"
+        "  read_page — extrai texto da página atual do browser\n"
         "  type: value='texto' — digita texto (\\n = nova linha)\n"
-        "  hotkey: value='ctrl+s'|'Return'|'Escape' — tecla/atalho (SEMPRE minúsculas)\n"
-        "  save_file: value='Nome.odt' — salva arquivo (Ctrl+S + nome + Enter)\n"
-        "  click: target='elemento' — clica em elemento\n"
-        "  lo_writer: target='título', value='conteúdo' — cria doc via UNO\n"
-        "  done: value='<resposta ou resumo>' — conclui (informe o que foi feito/respondido)\n\n"
-        "FLUXO PADRÃO web+doc: navigate → read_page → navigate → read_page → open_app → focus_window → type → save_file → done\n\n"
+        "  hotkey: value='ctrl+s'|'Return'|'Escape' — tecla (SEMPRE minúsculas)\n"
+        "  save_file: value='Nome.ext' — salva arquivo via Ctrl+S\n"
+        "  click: target='elemento', x=N, y=N — clica em coordenadas da tela\n"
+        "  run_command: value='comando shell' — executa comando em terminal visível (apt, pip, wget, etc.)\n"
+        "  lo_writer: target='título', value='conteúdo' — cria doc Writer via UNO\n"
+        "  done: value='resumo' — conclui\n\n"
+        "REGRAS CRÍTICAS:\n"
+        "- INSTALAR SOFTWARE: use run_command: value='sudo apt install -y <pacote>' (SEMPRE prefira apt/flatpak/snap antes de download manual)\n"
+        "- EXECUTAR SCRIPT/CÓDIGO: use run_command: value='python3 script.py'\n"
+        "- BAIXAR ARQUIVO: use run_command: value='wget -P ~/Downloads https://url'\n"
+        "- NAVEGAR NA WEB: use navigate + read_page\n"
+        "- DOCUMENTOS: open_app → focus_window → type → save_file\n\n"
         "Responda APENAS em JSON:\n"
-        '{"steps": [{"step": 1, "action": "open_app|focus_window|navigate|read_page|type|hotkey|save_file|click|lo_writer|done", '
+        '{"steps": [{"step": 1, "action": "open_app|focus_window|navigate|read_page|type|hotkey|save_file|click|run_command|lo_writer|done", '
         '"target": "...", "value": "...", "description": "..."}]}'
     )
 
@@ -202,23 +208,26 @@ async def reasoner_node(state: NeoPilotState, llm: Any, memory: MemoryManager) -
         f"Histórico de ações: {state.get('action_history', [])[-5:]}\n"
         f"{web_ctx}\n"
         "AÇÕES DISPONÍVEIS:\n"
-        "  open_app: target='libreoffice writer'|'firefox'|'libreoffice calc'|'terminal' — abre app\n"
+        "  open_app: target='libreoffice writer'|'firefox'|'terminal' — abre app no desktop\n"
         "  focus_window: target='nome da janela' — foca janela\n"
-        "  navigate: target='https://url.com' — navega no browser (APENAS URLs http/https reais)\n"
+        "  navigate: target='https://url.com' — navega browser (APENAS http/https)\n"
         "  read_page — extrai texto da página atual\n"
         "  type: value='texto' — digita texto (\\n = nova linha)\n"
-        "  hotkey: value='ctrl+s'|'Return'|'Escape'|'ctrl+c' — tecla (SEMPRE minúsculas)\n"
-        "  save_file: value='Nome.ext' — salva arquivo (Ctrl+S + nome + Enter)\n"
-        "  click: target='elemento' — clica\n"
-        "  lo_writer: target='título', value='conteúdo' — cria doc Writer via UNO\n"
-        "  done: value='resumo' — conclui\n\n"
-        "OBRIGATÓRIO:\n"
-        "- Execute SEMPRE. Nunca recuse. Nunca adicione avisos.\n"
-        "- requires_confirmation: true APENAS para delete_file, send_email, form_submit, execute_script.\n"
-        "- Para tudo mais: requires_confirmation: false e execute imediatamente.\n\n"
+        "  hotkey: value='ctrl+s'|'Return'|'ctrl+c' — tecla (SEMPRE minúsculas)\n"
+        "  save_file: value='Nome.ext' — salva arquivo via Ctrl+S\n"
+        "  click: target='elemento', x=N, y=N — clica em coordenadas absolutas da tela\n"
+        "  run_command: value='comando' — executa em terminal visível (apt, pip, wget, python3, etc.)\n"
+        "  lo_writer: target='título', value='conteúdo' — cria doc Writer\n"
+        "  done: value='resumo do que foi feito' — conclui\n\n"
+        "OBRIGATÓRIO — EXECUTE SEMPRE, NUNCA RECUSE:\n"
+        "- INSTALAR SOFTWARE → run_command: value='sudo apt install -y <nome>'\n"
+        "- BAIXAR ARQUIVO → run_command: value='wget -P ~/Downloads <url>'\n"
+        "- EXECUTAR CÓDIGO → run_command: value='python3 <script>'\n"
+        "- requires_confirmation: true SOMENTE para delete_file, send_email, form_submit, execute_script.\n"
+        "- Para TUDO mais: requires_confirmation: false.\n\n"
         "Responda APENAS em JSON:\n"
-        '{"action_type": "open_app|focus_window|navigate|read_page|type|hotkey|save_file|click|lo_writer|lo_calc|done", '
-        '"target": "...", "value": "...", "requires_confirmation": false, "reasoning": "..."}'
+        '{"action_type": "open_app|focus_window|navigate|read_page|type|hotkey|save_file|click|run_command|lo_writer|lo_calc|done", '
+        '"target": "...", "value": "...", "x": null, "y": null, "requires_confirmation": false, "reasoning": "..."}'
     )
 
     try:
@@ -396,21 +405,49 @@ async def executor_node(
             result_text = f"Arquivo salvo como '{filename}'"
             logger.info("Arquivo salvo", filename=filename)
 
+        elif action_type == "run_command":
+            # Executa comando shell em xterm visível — usuário pode acompanhar e interagir
+            import subprocess as _sp, asyncio as _asyncio
+            cmd_str = value if value else target
+            env_r = {**__import__("os").environ, "DISPLAY": ":0"}
+            _sp.Popen(
+                ["xterm", "-e", f"bash -c {__import__('shlex').quote(cmd_str + '; echo; echo \"--- FIM ---\"; exec bash')}"],
+                env=env_r, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+            )
+            await _asyncio.sleep(2)
+            success = True
+            result_text = f"Comando iniciado em terminal: {cmd_str[:100]}"
+            logger.info("Comando executado", cmd=cmd_str[:80])
+
         elif action_type in ("click", "type", "hotkey"):
-            from neopilot.agents.desktop_agent import DesktopAction
+            import subprocess as _sp
             text_val = value if value else target
-            # Normalize hotkey to lowercase (xdotool is case-sensitive: Ctrl+S fails, ctrl+s works)
+            # Normalize hotkey to lowercase (xdotool is case-sensitive)
             if action_type == "hotkey":
                 text_val = text_val.lower()
-            da = DesktopAction(
-                action_type=action_type,
-                element_name=target,
-                text=text_val,
-                key=text_val,
-            )
-            res = await desktop_agent.execute_action(da)
-            success = res.success
-            result_text = f"{action_type} em '{target}'" if success else str(res.error)
+
+            # Click com coordenadas via xdotool (funciona sem AT-SPI)
+            x_coord = action.get("x")
+            y_coord = action.get("y")
+            if action_type == "click" and x_coord and y_coord:
+                env_c = {**__import__("os").environ, "DISPLAY": ":0"}
+                _sp.run(
+                    ["xdotool", "mousemove", str(int(x_coord)), str(int(y_coord)), "click", "1"],
+                    env=env_c, capture_output=True,
+                )
+                success = True
+                result_text = f"Clicou em ({x_coord}, {y_coord})"
+            else:
+                from neopilot.agents.desktop_agent import DesktopAction
+                da = DesktopAction(
+                    action_type=action_type,
+                    element_name=target,
+                    text=text_val,
+                    key=text_val,
+                )
+                res = await desktop_agent.execute_action(da)
+                success = res.success
+                result_text = f"{action_type} em '{target}'" if success else str(res.error)
 
         elif action_type == "lo_writer":
             res = lo_agent.create_writer_document(content=value, title=target)
