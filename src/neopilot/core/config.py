@@ -137,7 +137,7 @@ class LibreOfficeSettings(BaseModel):
 
 
 class AgentSettings(BaseModel):
-    mode: AgentMode = AgentMode.ASSISTED
+    mode: AgentMode = AgentMode.AUTONOMOUS
     language: str = "pt-BR"
     confirmation_timeout_seconds: int = 60
     max_steps_per_task: int = 50

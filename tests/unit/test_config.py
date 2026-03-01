@@ -11,7 +11,7 @@ from neopilot.core.config import (
 
 def test_default_agent_settings():
     s = AgentSettings()
-    assert s.mode == AgentMode.ASSISTED
+    assert s.mode == AgentMode.AUTONOMOUS
     assert s.max_steps_per_task == 50
 
 
