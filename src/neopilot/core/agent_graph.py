@@ -87,20 +87,40 @@ async def planner_node(state: NeoPilotState, llm: Any, memory: MemoryManager) ->
     memory_ctx = memory.format_context_for_llm(task)
     sys_prompt = _make_system_prompt(state, memory_ctx)
 
+    # Detect desktop-action keywords to prevent misclassification as informational
+    desktop_keywords = (
+        "abra", "abre", "abrir", "cria", "crie", "criar", "navega", "navegue", "navegar",
+        "firefox", "chrome", "browser", "libreoffice", "writer", "calc", "impress",
+        "documento", "planilha", "apresentação", "escreve", "escreva", "escrever",
+        "salva", "salve", "salvar", "digita", "digite", "digitar", "clica", "clique",
+        "terminal", "baixa", "baixe", "baixar", "instala", "instale", "executa",
+        "pesquise na", "pesquisa na", "busque na", "acesse", "acessar", "internet",
+    )
+    task_lower = task.lower()
+    is_desktop_task = any(kw in task_lower for kw in desktop_keywords)
+
     plan_prompt = (
         f"Tarefa: {task}\n\n"
-        "REGRAS IMPORTANTES:\n"
-        "1. Se a tarefa é INFORMACIONAL (pergunta, explicação) → use action='done' em 1 passo.\n"
-        "2. Se a tarefa exige ações no desktop/browser → decomponha em passos concretos (máx. 15).\n"
-        "3. Para abrir apps desktop: use action='open_app', target='libreoffice writer' ou 'firefox'.\n"
-        "4. Para navegar na web: use action='navigate', target='https://url.real.com' (SOMENTE URLs com http/https).\n"
-        "5. Para LER o conteúdo da página atual: use action='read_page' (não precisa de target).\n"
-        "6. Para focar janela antes de digitar: use action='focus_window', target='LibreOffice Writer'.\n"
-        "7. Para digitar texto: use action='type', value='texto completo a digitar'.\n"
-        "8. Para salvar arquivo com nome: use action='save_file', value='NomeArquivo.odt' (envia Ctrl+S + nome + Enter automaticamente).\n"
-        "9. Para teclas simples: use action='hotkey', value='ctrl+a'|'Return'|'Escape'.\n"
-        "10. Ações válidas: open_app, focus_window, navigate, read_page, click, type, hotkey, save_file, lo_writer, done.\n"
-        "EXEMPLO de fluxo web+doc: navigate → read_page → navigate → read_page → open_app → focus_window → type → save_file → done\n\n"
+        "CLASSIFICAÇÃO OBRIGATÓRIA:\n"
+        + (
+            "⚠ AÇÃO DE DESKTOP DETECTADA — decomponha em passos concretos (NÃO use done em 1 passo).\n\n"
+            if is_desktop_task else
+            "ℹ Tarefa pode ser informacional. Avalie:\n"
+            "  - Se for pergunta de conhecimento PURO (sem apps/browser/arquivos): use 1 passo action='done', value='<resposta completa>'.\n"
+            "  - Se exige apps/browser/arquivos: decomponha em passos.\n\n"
+        )
+        + "AÇÕES DISPONÍVEIS:\n"
+        "  open_app: target='libreoffice writer'|'firefox'|'libreoffice calc' — abre app\n"
+        "  focus_window: target='nome da janela' — foca janela\n"
+        "  navigate: target='https://url.com' — navega no browser (APENAS URLs reais http/https)\n"
+        "  read_page — extrai texto da página atual\n"
+        "  type: value='texto' — digita texto (\\n = nova linha)\n"
+        "  hotkey: value='ctrl+s'|'Return'|'Escape' — tecla/atalho (SEMPRE minúsculas)\n"
+        "  save_file: value='Nome.odt' — salva arquivo (Ctrl+S + nome + Enter)\n"
+        "  click: target='elemento' — clica em elemento\n"
+        "  lo_writer: target='título', value='conteúdo' — cria doc via UNO\n"
+        "  done: value='<resposta ou resumo>' — conclui (informe o que foi feito/respondido)\n\n"
+        "FLUXO PADRÃO web+doc: navigate → read_page → navigate → read_page → open_app → focus_window → type → save_file → done\n\n"
         "Responda APENAS em JSON:\n"
         '{"steps": [{"step": 1, "action": "open_app|focus_window|navigate|read_page|type|hotkey|save_file|click|lo_writer|done", '
         '"target": "...", "value": "...", "description": "..."}]}'
@@ -123,11 +143,12 @@ async def planner_node(state: NeoPilotState, llm: Any, memory: MemoryManager) ->
             # Fallback: plano de passo único
             plan = [{"step": 1, "action": "direct", "target": task, "description": task}]
 
-        logger.info("Plano criado", steps=len(plan))
+        step_actions = [s.get("action") for s in plan]
+        logger.info("Plano criado", steps=len(plan), actions=step_actions)
         return {
             "plan": plan,
             "current_step": 0,
-            "messages": [AIMessage(content=f"Plano: {len(plan)} passos")],
+            "messages": [AIMessage(content=f"Plano: {len(plan)} passos → {step_actions}")],
         }
     except Exception as e:
         logger.error("Falha no planejamento", error=str(e))
@@ -272,9 +293,15 @@ async def executor_node(
 
     try:
         if action_type == "done":
+            # Use answer from plan step value/description, or reasoner's value
+            plan = state.get("plan", [])
+            step_idx = state.get("current_step", 0)
+            plan_step = plan[step_idx] if step_idx < len(plan) else {}
+            answer = value or plan_step.get("value") or plan_step.get("description") or ""
+            result_msg = answer if answer and answer != task else "Tarefa concluída com sucesso"
             return {
                 "done": True,
-                "result": "Tarefa concluída com sucesso",
+                "result": result_msg,
                 "current_step": state["current_step"] + 1,
             }
 
@@ -378,6 +405,9 @@ async def executor_node(
         elif action_type in ("click", "type", "hotkey"):
             from neopilot.agents.desktop_agent import DesktopAction
             text_val = value if value else target
+            # Normalize hotkey to lowercase (xdotool is case-sensitive: Ctrl+S fails, ctrl+s works)
+            if action_type == "hotkey":
+                text_val = text_val.lower()
             da = DesktopAction(
                 action_type=action_type,
                 element_name=target,
@@ -444,17 +474,18 @@ async def reflector_node(state: NeoPilotState, llm: Any, memory: MemoryManager) 
 
     # Tarefa completa
     if step_idx >= len(plan):
-        # Salva episódio na memória
+        # Salva episódio na memória com o resultado real (não só a observação da tela)
+        final_result = state.get("result") or observation
         episode = Episode(
             task=state["task"],
             steps=state.get("action_history", []),
-            result=observation,
+            result=final_result,
             success=True,
             app_name=state.get("active_app"),
             session_id=state.get("session_id", ""),
         )
         memory.remember_episode(episode)
-        return {"done": True, "result": "Tarefa concluída com sucesso"}
+        return {"done": True, "result": final_result or "Tarefa concluída com sucesso"}
 
     # Observa se precisa replanejar
     if "erro" in observation.lower() or "falh" in observation.lower():
