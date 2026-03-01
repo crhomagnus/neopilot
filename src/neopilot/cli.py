@@ -121,15 +121,22 @@ def _start_gui(professor: bool, voice: bool, provider: str) -> None:
             return result
 
         def _done(future):
-            result = future.result()
-            success = result.get("success", False)
-            msg = result.get("result", "Concluído")
-            window.add_message(ChatMessage(
-                role="agent" if success else "error",
-                content=msg,
-            ))
-            tts.speak_notification(msg[:100])
-            window.set_status(AgentStatus.IDLE)
+            try:
+                result = future.result()
+                success = result.get("success", False)
+                msg = result.get("result", "Concluído")
+                window.add_message(ChatMessage(
+                    role="agent" if success else "error",
+                    content=msg,
+                ))
+                try:
+                    tts.speak_notification(msg[:100])
+                except Exception:
+                    pass
+            except Exception as e:
+                window.add_message(ChatMessage(role="error", content=f"Erro: {e}"))
+            finally:
+                window.set_status(AgentStatus.IDLE)
 
         future = asyncio.run_coroutine_threadsafe(_exec(), loop)
         future.add_done_callback(_done)

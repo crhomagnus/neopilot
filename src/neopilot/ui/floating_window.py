@@ -391,10 +391,18 @@ class GTK4FloatingWindow(FloatingWindowBase):
         if not self._input_entry:
             return
         text = self._input_entry.get_text().strip()
-        if text and self._on_user_input:
-            self.add_message(ChatMessage(role="user", content=text))
-            self._input_entry.set_text("")
+        if not text:
+            return
+        # Sempre mostra a mensagem do usuário no chat
+        self.add_message(ChatMessage(role="user", content=text))
+        self._input_entry.set_text("")
+        if self._on_user_input:
             self._on_user_input(text)
+        else:
+            self.add_message(ChatMessage(
+                role="system",
+                content="Inicie com 'neopilot chat' para conectar o agente.",
+            ))
 
     def _on_approve_click(self, _btn: Any) -> None:
         if self._pending_confirmation:
@@ -507,10 +515,17 @@ class Qt6FloatingWindow(FloatingWindowBase):
 
     def _qt_send(self) -> None:
         text = self._qt_input.text().strip()
-        if text and self._on_user_input:
-            self.add_message(ChatMessage(role="user", content=text))
-            self._qt_input.clear()
+        if not text:
+            return
+        self.add_message(ChatMessage(role="user", content=text))
+        self._qt_input.clear()
+        if self._on_user_input:
             self._on_user_input(text)
+        else:
+            self.add_message(ChatMessage(
+                role="system",
+                content="Inicie com 'neopilot chat' para conectar o agente.",
+            ))
 
     def _qt_process_queue(self) -> None:
         try:
