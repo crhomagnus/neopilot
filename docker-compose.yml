@@ -1,0 +1,53 @@
+version: "3.9"
+
+services:
+  neopilot:
+    build: .
+    container_name: neopilot
+    environment:
+      - DISPLAY=:99
+      - NEOPILOT_AGENT__MODE=copilot
+      - NEOPILOT_LLM__PROVIDER=anthropic
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - NEOPILOT_ENABLE_LIBREOFFICE=true
+    volumes:
+      - neopilot-data:/home/neopilot/.neopilot
+      - ${HOME}/Documentos:/home/neopilot/Documentos
+      - ${HOME}/Downloads:/home/neopilot/Downloads
+    ports:
+      - "8765:8765"   # Professor Dashboard
+    devices:
+      - /dev/snd:/dev/snd  # Áudio (microfone)
+    networks:
+      - neopilot-net
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - SYS_PTRACE  # Para AT-SPI
+
+  # Professor Dashboard como serviço separado (opcional)
+  professor-dashboard:
+    build: .
+    container_name: neopilot-professor
+    command: ["neopilot", "professor", "--host", "0.0.0.0", "--port", "8765"]
+    ports:
+      - "8766:8765"
+    volumes:
+      - neopilot-data:/home/neopilot/.neopilot:ro
+    networks:
+      - neopilot-net
+    depends_on:
+      - neopilot
+    restart: unless-stopped
+
+volumes:
+  neopilot-data:
+    driver: local
+
+networks:
+  neopilot-net:
+    driver: bridge

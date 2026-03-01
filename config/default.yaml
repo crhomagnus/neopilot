@@ -1,0 +1,78 @@
+agent:
+  mode: "assisted"           # assisted | autonomous
+  language: "pt-BR"
+  confirmation_timeout_seconds: 60
+  max_steps_per_task: 50
+  max_retries_per_step: 3
+  step_timeout_seconds: 30
+
+llm:
+  primary:
+    provider: "anthropic"
+    model: "claude-sonnet-4-6"
+    temperature: 0.1
+    max_tokens: 4096
+  fallback:
+    provider: "ollama"
+    model: "qwen2.5-vl:7b"
+    temperature: 0.1
+  vision_grounder:
+    provider: "local"
+    model: "ui-tars-7b"
+
+voice:
+  stt:
+    engine: "faster-whisper"
+    model: "medium"
+    language: "pt"
+    device: "cpu"
+    vad_enabled: true
+    vad_threshold: 0.5
+  tts:
+    engine: "pyttsx3"
+    voice_id: ""
+    rate: 175
+    volume: 0.9
+  hotkey: "ctrl+space"
+  push_to_talk_key: "ctrl+shift+space"
+
+security:
+  sandbox: "firejail"
+  allowed_directories:
+    - "~/Documents"
+    - "~/Downloads"
+    - "~/Desktop"
+    - "~/Pictures"
+    - "~/Videos"
+  blocked_directories:
+    - "~/.ssh"
+    - "~/.gnupg"
+    - "~/.config/neopilot/vault"
+  require_confirmation_for:
+    - "delete_file"
+    - "send_email"
+    - "form_submit"
+    - "execute_script"
+    - "send_message"
+  daily_api_limit_usd: 5.00
+
+memory:
+  episodic_retention_days: 90
+  semantic_embedding_model: "all-MiniLM-L6-v2"
+  vector_store: "chromadb"
+  db_path: "~/.neopilot/memory/"
+  max_context_tokens: 8000
+
+libreoffice:
+  connection: "socket"
+  host: "localhost"
+  port: 2002
+  auto_start: true
+  timeout_seconds: 15
+
+logging:
+  level: "INFO"
+  file: "~/.neopilot/logs/neopilot.log"
+  max_bytes: 10485760
+  backup_count: 5
+  format: "json"
