@@ -1,0 +1,61 @@
+# NeoPilot v2.0 — Multi-service Docker Compose
+# Backend + Postgres + Redis
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - NEOPILOT_DATABASE_URL=postgresql+asyncpg://neopilot:neopilot@postgres:5432/neopilot
+      - NEOPILOT_REDIS_URL=redis://redis:6379/0
+      - NEOPILOT_REDIS_ENABLED=true
+      - NEOPILOT_CLAUDE_MODEL=${CLAUDE_MODEL:-claude-sonnet-4-20250514}
+      - NEOPILOT_DEBUG=${DEBUG:-false}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: neopilot
+      POSTGRES_PASSWORD: neopilot
+      POSTGRES_DB: neopilot
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U neopilot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+  redisdata:

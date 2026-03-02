@@ -21,3 +21,6 @@ htmlcov/
 *.ods
 *.odp
 docs/_build/
+*.db
+*.sqlite
+*.sqlite3
